@@ -72,6 +72,12 @@ class PanelLv1_AnnotationModule(wx.Panel):
 		button_autoannotate.Bind(wx.EVT_BUTTON,self.auto_annotate)
 		wx.Button.SetToolTip(button_autoannotate,'Use a trained Annotator to automatically annotate selected images for you.')
 		boxsizer.Add(button_autoannotate,0,wx.ALIGN_CENTER,10)
+		boxsizer.Add(0,5,0)
+
+		button_bobbysedit=wx.Button(panel,label="Bobby's Interactive Edit",size=(300,40))
+		button_bobbysedit.Bind(wx.EVT_BUTTON,self.bobbys_edit)
+		wx.Button.SetToolTip(button_bobbysedit,'Open Bobby\'s Interactive Edit mode for review/edit annotation workflow.')
+		boxsizer.Add(button_bobbysedit,0,wx.ALIGN_CENTER,10)
 		boxsizer.Add(0,50,0)
 
 		panel.SetSizer(boxsizer)
@@ -91,6 +97,14 @@ class PanelLv1_AnnotationModule(wx.Panel):
 
 		panel=PanelLv2_AutoAnnotation(self.notebook)
 		title='Annotate Automatically'
+		self.notebook.AddPage(panel,title,select=True)
+
+
+	def bobbys_edit(self,event):
+
+		from .gui_bobbysedit import PanelLv2_BobbysEdit
+		panel=PanelLv2_BobbysEdit(self.notebook)
+		title="Bobby's Interactive Edit"
 		self.notebook.AddPage(panel,title,select=True)
 
 
