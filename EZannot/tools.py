@@ -2,6 +2,7 @@ import os
 import cv2
 import json
 import random
+import shutil
 import itertools
 import numpy as np
 from pycocotools import mask as mk
@@ -542,7 +543,154 @@ def resize_annotation(path_to_images,out_path,scale=0.5):
 		print('Annotation resizing completed.')
 
 
+_IMAGE_SAMPLER_EXTS=frozenset({'.jpg','.jpeg','.png','.tif','.tiff','.bmp'})
 
+
+def _sampler_is_valid_image_filename(filename):
+
+	return os.path.splitext(filename)[1].lower() in _IMAGE_SAMPLER_EXTS
+
+
+def _sampler_pool_entries(image_pool_dir):
+
+	entries=[]
+	if not image_pool_dir or not os.path.isdir(image_pool_dir):
+		return entries
+	for name in os.listdir(image_pool_dir):
+		path=os.path.join(image_pool_dir,name)
+		if os.path.isfile(path) and _sampler_is_valid_image_filename(name):
+			entries.append((name,path))
+	return entries
+
+
+def _sampler_used_basenames_lower(dataset_dir):
+
+	used=set()
+	if not dataset_dir or not os.path.isdir(dataset_dir):
+		return used
+	ann_path=os.path.join(dataset_dir,'annotations.json')
+	if not os.path.isfile(ann_path):
+		return used
+	try:
+		with open(ann_path) as f:
+			data=json.load(f)
+	except (json.JSONDecodeError,OSError):
+		return used
+	for img in data.get('images',[]) or []:
+		fn=img.get('file_name')
+		if fn:
+			used.add(os.path.basename(str(fn)).lower())
+	return used
+
+
+def _sampler_disk_image_basenames_lower(dataset_dir):
+
+	on_disk=set()
+	if not dataset_dir or not os.path.isdir(dataset_dir):
+		return on_disk
+	for name in os.listdir(dataset_dir):
+		path=os.path.join(dataset_dir,name)
+		if os.path.isfile(path) and _sampler_is_valid_image_filename(name):
+			on_disk.add(os.path.basename(name).lower())
+	return on_disk
+
+
+def _sampler_all_used_basenames_lower(dataset_dir):
+
+	return _sampler_used_basenames_lower(dataset_dir)|_sampler_disk_image_basenames_lower(dataset_dir)
+
+
+def _sampler_dataset_image_count(dataset_dir):
+
+	return len(_sampler_all_used_basenames_lower(dataset_dir))
+
+
+def _sampler_eligible_entries(image_pool_dir,dataset_dir):
+
+	used=_sampler_all_used_basenames_lower(dataset_dir)
+	out=[]
+	for name,path in _sampler_pool_entries(image_pool_dir):
+		if os.path.basename(name).lower() not in used:
+			out.append((name,path))
+	return out
+
+
+def image_sampler_directory_stats(image_pool_dir,dataset_dir):
+
+	"""Counts for Bobby's Image Sampler UI: pool size, distinct used basenames (annotations ∪ on-disk images), eligible."""
+
+	pool=_sampler_pool_entries(image_pool_dir)
+	eligible=_sampler_eligible_entries(image_pool_dir,dataset_dir)
+	return {
+		'pool_count':len(pool),
+		'dataset_image_count':_sampler_dataset_image_count(dataset_dir),
+		'eligible_count':len(eligible),
+	}
+
+
+def sample_from_pool(image_pool_dir,dataset_dir,n_samples,seed=42,progress_callback=None):
+
+	"""
+	Non-destructively samples N new images from an image pool into a dataset folder.
+
+	- Reads annotations.json from dataset_dir if it exists (COCO-style)
+	- Extracts already-used filenames from the images array, and unions with image files
+	  already present on disk in dataset_dir (.jpg .jpeg .png .tif .tiff .bmp, case-insensitive)
+	- Scans image_pool_dir for all valid images (.jpg .jpeg .png .tif .tiff .bmp, case-insensitive)
+	- Filters out already-used images by filename
+	- If n_samples exceeds available eligible images, uses all available and returns a warning
+	- Randomly samples n_samples images using the provided seed (random.seed(seed))
+	- Copies sampled images into dataset_dir (shutil.copy2), skipping any that already exist
+	- Never modifies image_pool_dir
+	- Never overwrites existing files in dataset_dir
+	- Optional progress_callback(current, total, basename): invoked from the caller's thread;
+	  current is 0..total (0 before work, then after each image processed). basename is '' when current==0.
+	- Returns a dict:
+	  {
+	    'copied': int,
+	    'requested': int,
+	    'available': int,
+	    'warning': str|None
+	  }
+	"""
+
+	eligible=_sampler_eligible_entries(image_pool_dir,dataset_dir)
+	available=len(eligible)
+	warning=None
+	if n_samples>available and available>0:
+		warning='Requested {} images but only {} eligible; all {} will be copied.'.format(n_samples,available,available)
+	elif n_samples>0 and available==0:
+		warning='No eligible images in pool (all may already appear in the dataset folder or annotations).'
+
+	k=min(max(n_samples,0),available)
+	random.seed(seed)
+	if k==0:
+		sampled=[]
+	else:
+		sampled=random.sample(eligible,k)
+
+	total=len(sampled)
+	if progress_callback is not None:
+		progress_callback(0,total,'')
+
+	copied=0
+	os.makedirs(dataset_dir,exist_ok=True)
+	for i,(name,src) in enumerate(sampled,1):
+		dst=os.path.join(dataset_dir,name)
+		if os.path.exists(dst):
+			pass
+		else:
+			shutil.copy2(src,dst)
+			copied+=1
+		if progress_callback is not None:
+			progress_callback(i,total,name)
+
+	return {
+		'copied':copied,
+		'requested':n_samples,
+		'available':available,
+		'warning':warning,
+	}
 
 
 

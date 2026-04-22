@@ -3,6 +3,8 @@ import cv2
 import wx
 import json
 import random
+import threading
+import time
 import torch
 import numpy as np
 from pathlib import Path
@@ -13,7 +15,7 @@ from screeninfo import get_monitors
 from EZannot.sam2.build_sam import build_sam2
 from EZannot.sam2.sam2_image_predictor import SAM2ImagePredictor
 from .annotator import AutoAnnotation
-from .tools import read_annotation,mask_to_polygon,generate_annotation
+from .tools import read_annotation,mask_to_polygon,generate_annotation,image_sampler_directory_stats,sample_from_pool
 
 
 
@@ -78,6 +80,12 @@ class PanelLv1_AnnotationModule(wx.Panel):
 		button_bobbysedit.Bind(wx.EVT_BUTTON,self.bobbys_edit)
 		wx.Button.SetToolTip(button_bobbysedit,'Open Bobby\'s Interactive Edit mode for review/edit annotation workflow.')
 		boxsizer.Add(button_bobbysedit,0,wx.ALIGN_CENTER,10)
+		boxsizer.Add(0,5,0)
+
+		button_bobbys_sampler=wx.Button(panel,label="Bobby's Image Sampler",size=(300,40))
+		button_bobbys_sampler.Bind(wx.EVT_BUTTON,self.bobbys_image_sampler)
+		wx.Button.SetToolTip(button_bobbys_sampler,'Sample random images from a pool folder into a dataset folder without overwriting existing files.')
+		boxsizer.Add(button_bobbys_sampler,0,wx.ALIGN_CENTER,10)
 		boxsizer.Add(0,50,0)
 
 		panel.SetSizer(boxsizer)
@@ -105,6 +113,13 @@ class PanelLv1_AnnotationModule(wx.Panel):
 		from .gui_bobbysedit import PanelLv2_BobbysEdit
 		panel=PanelLv2_BobbysEdit(self.notebook)
 		title="Bobby's Interactive Edit"
+		self.notebook.AddPage(panel,title,select=True)
+
+
+	def bobbys_image_sampler(self,event):
+
+		panel=PanelLv2_BobbysImageSampler(self.notebook)
+		title="Bobby's Image Sampler"
 		self.notebook.AddPage(panel,title,select=True)
 
 
@@ -931,4 +946,350 @@ class PanelLv2_AutoAnnotation(wx.Panel):
 			AA=AutoAnnotation(self.path_to_images,self.path_to_annotator,self.object_kinds,detection_threshold=self.detection_threshold,filters=self.filters)
 			AA.annotate_images(sliding=self.sliding,overlap=self.overlap_ratio)
 
+
+class PanelLv2_BobbysImageSampler(wx.Panel):
+
+	_IMG_SAMPLER_BTN_SIZE=(300,40)
+
+	def __init__(self,parent):
+
+		super().__init__(parent)
+		self.notebook=parent
+		self.image_pool_dir=None
+		self.dataset_dir=None
+		self.n_samples=100
+		self.seed=42
+		self._sampler_elapse_timer=None
+		self._sampler_running=False
+		self._sampler_start_time=0.0
+		self._sampler_progress_cur=0
+		self._sampler_progress_tot=0
+
+		self.display_window()
+
+
+	@staticmethod
+	def _fmt_hms(seconds):
+
+		sec=max(0,int(round(seconds)))
+		h,rem=divmod(sec,3600)
+		m,s=divmod(rem,60)
+		return '{}:{:02d}:{:02d}'.format(h,m,s)
+
+
+	def display_window(self):
+
+		panel=self
+		boxsizer=wx.BoxSizer(wx.VERTICAL)
+		module_pool=wx.BoxSizer(wx.HORIZONTAL)
+		button_pool=wx.Button(panel,label='Select the image\npool folder',size=self._IMG_SAMPLER_BTN_SIZE)
+		button_pool.Bind(wx.EVT_BUTTON,self.select_pool_folder)
+		self.text_pool=wx.StaticText(panel,label='Pool folder: (not selected)',style=wx.ALIGN_LEFT|wx.ST_ELLIPSIZE_END)
+		module_pool.Add(button_pool,0,wx.LEFT|wx.RIGHT|wx.EXPAND,10)
+		module_pool.Add(self.text_pool,0,wx.LEFT|wx.RIGHT|wx.EXPAND,10)
+		boxsizer.Add(0,10,0)
+		boxsizer.Add(module_pool,0,wx.LEFT|wx.RIGHT|wx.EXPAND,10)
+		boxsizer.Add(0,5,0)
+
+		module_dataset=wx.BoxSizer(wx.HORIZONTAL)
+		button_dataset=wx.Button(panel,label='Select the\ndataset folder',size=self._IMG_SAMPLER_BTN_SIZE)
+		button_dataset.Bind(wx.EVT_BUTTON,self.select_dataset_folder)
+		self.text_dataset=wx.StaticText(panel,label='Dataset folder: (not selected)',style=wx.ALIGN_LEFT|wx.ST_ELLIPSIZE_END)
+		module_dataset.Add(button_dataset,0,wx.LEFT|wx.RIGHT|wx.EXPAND,10)
+		module_dataset.Add(self.text_dataset,0,wx.LEFT|wx.RIGHT|wx.EXPAND,10)
+		boxsizer.Add(module_dataset,0,wx.LEFT|wx.RIGHT|wx.EXPAND,10)
+		boxsizer.Add(0,5,0)
+
+		module_eligible=wx.BoxSizer(wx.HORIZONTAL)
+		elig_ph=wx.Panel(panel,size=self._IMG_SAMPLER_BTN_SIZE)
+		self.text_eligible=wx.StaticText(panel,label='Eligible images: -',style=wx.ALIGN_LEFT|wx.ST_ELLIPSIZE_END)
+		self.text_eligible_warn=wx.StaticText(panel,label='',style=wx.ALIGN_LEFT|wx.ST_ELLIPSIZE_END)
+		self.text_eligible_warn.SetForegroundColour(wx.Colour(255,140,0))
+		elig_col=wx.BoxSizer(wx.VERTICAL)
+		elig_col.Add(self.text_eligible,0,wx.EXPAND)
+		elig_col.Add(self.text_eligible_warn,0,wx.EXPAND)
+		module_eligible.Add(elig_ph,0,wx.LEFT|wx.RIGHT|wx.EXPAND,10)
+		module_eligible.Add(elig_col,0,wx.LEFT|wx.RIGHT|wx.EXPAND,10)
+		boxsizer.Add(module_eligible,0,wx.LEFT|wx.RIGHT|wx.EXPAND,10)
+		boxsizer.Add(0,5,0)
+
+		module_n=wx.BoxSizer(wx.HORIZONTAL)
+		button_n=wx.Button(panel,label='Set number of images\nto sample',size=self._IMG_SAMPLER_BTN_SIZE)
+		button_n.Bind(wx.EVT_BUTTON,self.set_n_samples)
+		self.text_n=wx.StaticText(panel,label='N: 100',style=wx.ALIGN_LEFT|wx.ST_ELLIPSIZE_END)
+		module_n.Add(button_n,0,wx.LEFT|wx.RIGHT|wx.EXPAND,10)
+		module_n.Add(self.text_n,0,wx.LEFT|wx.RIGHT|wx.EXPAND,10)
+		boxsizer.Add(module_n,0,wx.LEFT|wx.RIGHT|wx.EXPAND,10)
+		boxsizer.Add(0,5,0)
+
+		module_seed=wx.BoxSizer(wx.HORIZONTAL)
+		button_seed=wx.Button(panel,label='Set random\nseed',size=self._IMG_SAMPLER_BTN_SIZE)
+		button_seed.Bind(wx.EVT_BUTTON,self.set_seed)
+		self.text_seed=wx.StaticText(panel,label='Seed: 42',style=wx.ALIGN_LEFT|wx.ST_ELLIPSIZE_END)
+		module_seed.Add(button_seed,0,wx.LEFT|wx.RIGHT|wx.EXPAND,10)
+		module_seed.Add(self.text_seed,0,wx.LEFT|wx.RIGHT|wx.EXPAND,10)
+		boxsizer.Add(module_seed,0,wx.LEFT|wx.RIGHT|wx.EXPAND,10)
+		boxsizer.Add(0,5,0)
+
+		self._sampler_step_buttons=(button_pool,button_dataset,button_n,button_seed)
+
+		self.button_run=wx.Button(panel,label="Run Bobby's Image Sampler",size=self._IMG_SAMPLER_BTN_SIZE)
+		self.button_run.Bind(wx.EVT_BUTTON,self.run_sampler)
+		boxsizer.Add(0,5,0)
+		boxsizer.Add(self.button_run,0,wx.RIGHT|wx.ALIGN_RIGHT,90)
+		boxsizer.Add(0,10,0)
+
+		self.progress_holder=wx.Panel(panel)
+		prog_sz=wx.BoxSizer(wx.VERTICAL)
+		self.gauge=wx.Gauge(self.progress_holder,range=1,size=(-1,18),style=wx.GA_HORIZONTAL)
+		prog_sz.Add(self.gauge,0,wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP,border=10)
+		self.text_copying=wx.StaticText(self.progress_holder,label='',style=wx.ALIGN_LEFT|wx.ST_ELLIPSIZE_END)
+		prog_sz.Add(self.text_copying,0,wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP,border=5)
+		self.text_elapsed_p=wx.StaticText(self.progress_holder,label='Elapsed: 0:00:00',style=wx.ALIGN_LEFT|wx.ST_ELLIPSIZE_END)
+		self.text_eta_p=wx.StaticText(self.progress_holder,label='Estimated completion: Calculating...',style=wx.ALIGN_LEFT|wx.ST_ELLIPSIZE_END)
+		prog_sz.Add(self.text_elapsed_p,0,wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP,border=5)
+		prog_sz.Add(self.text_eta_p,0,wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP|wx.BOTTOM,border=5)
+		self.progress_holder.SetSizer(prog_sz)
+		self.progress_holder.Hide()
+		boxsizer.Add(self.progress_holder,0,wx.LEFT|wx.RIGHT|wx.EXPAND,10)
+		boxsizer.Add(0,10,0)
+
+		panel.SetSizer(boxsizer)
+		self.Bind(wx.EVT_WINDOW_DESTROY,self._sampler_on_destroy)
+		self.Centre()
+		self.Show(True)
+		self.refresh_descriptions()
+
+
+	def _sampler_on_destroy(self,event):
+
+		self._sampler_running=False
+		self._sampler_stop_elapse_timer()
+		event.Skip()
+
+
+	def _sampler_stop_elapse_timer(self):
+
+		t=self._sampler_elapse_timer
+		if t is not None:
+			t.Stop()
+			self._sampler_elapse_timer=None
+
+
+	def refresh_descriptions(self):
+
+		pool_dir=self.image_pool_dir or ''
+		ds_dir=self.dataset_dir or ''
+		stats=image_sampler_directory_stats(pool_dir,ds_dir)
+		pool_c=stats['pool_count']
+		ds_img=stats['dataset_image_count']
+		elig=stats['eligible_count']
+
+		if self.image_pool_dir:
+			self.text_pool.SetLabel('Pool folder: {}\n{} images found in pool'.format(self.image_pool_dir,pool_c))
+		else:
+			self.text_pool.SetLabel('Pool folder: (not selected)')
+
+		if self.dataset_dir:
+			self.text_dataset.SetLabel('Dataset folder: {}\n{} images already in dataset'.format(self.dataset_dir,ds_img))
+		else:
+			self.text_dataset.SetLabel('Dataset folder: (not selected)')
+
+		self.text_eligible.SetLabel('Eligible images: {} images eligible for sampling'.format(elig))
+
+		if self.n_samples>elig:
+			self.text_eligible_warn.SetLabel('Only {} images available — all will be copied.'.format(elig))
+			self.text_eligible_warn.Show()
+		else:
+			self.text_eligible_warn.SetLabel('')
+			self.text_eligible_warn.Hide()
+
+		self.text_n.SetLabel('N: {}'.format(self.n_samples))
+		self.text_seed.SetLabel('Seed: {}'.format(self.seed))
+		self.Layout()
+
+
+	def select_pool_folder(self,event):
+
+		if self._sampler_running:
+			return
+		dialog=wx.DirDialog(self,'Select the image pool folder','',style=wx.DD_DEFAULT_STYLE)
+		if dialog.ShowModal()==wx.ID_OK:
+			self.image_pool_dir=dialog.GetPath()
+		dialog.Destroy()
+		self.refresh_descriptions()
+
+
+	def select_dataset_folder(self,event):
+
+		if self._sampler_running:
+			return
+		dialog=wx.DirDialog(self,'Select the dataset folder','',style=wx.DD_DEFAULT_STYLE)
+		if dialog.ShowModal()==wx.ID_OK:
+			self.dataset_dir=dialog.GetPath()
+		dialog.Destroy()
+		self.refresh_descriptions()
+
+
+	def set_n_samples(self,event):
+
+		if self._sampler_running:
+			return
+		dialog=wx.NumberEntryDialog(self,'How many images to copy from the pool into the dataset.','Integer:','Number of images to sample',self.n_samples,0,1000000000)
+		if dialog.ShowModal()==wx.ID_OK:
+			self.n_samples=int(dialog.GetValue())
+		dialog.Destroy()
+		self.refresh_descriptions()
+
+
+	def set_seed(self,event):
+
+		if self._sampler_running:
+			return
+		dialog=wx.NumberEntryDialog(self,'Random seed for sampling reproducibility.','Integer:','Random seed',self.seed,-2147483648,2147483647)
+		if dialog.ShowModal()==wx.ID_OK:
+			self.seed=int(dialog.GetValue())
+		dialog.Destroy()
+		self.refresh_descriptions()
+
+
+	def _sampler_refresh_elapse_eta(self):
+
+		elapsed=time.time()-self._sampler_start_time
+		self.text_elapsed_p.SetLabel('Elapsed: '+self._fmt_hms(elapsed))
+		tot=self._sampler_progress_tot
+		cur=self._sampler_progress_cur
+		if elapsed<3.0:
+			eta_lbl='Estimated completion: Calculating...'
+		elif tot<=0:
+			eta_lbl='Estimated completion: Calculating...'
+		elif cur<=0:
+			eta_lbl='Estimated completion: Estimating...'
+		else:
+			rate=elapsed/float(cur)
+			rem=max(0.0,(tot-cur)*rate)
+			eta_lbl='Estimated completion: '+self._fmt_hms(rem)
+		self.text_eta_p.SetLabel(eta_lbl)
+
+
+	def _sampler_elapse_tick(self):
+
+		if not self._sampler_running:
+			return
+		self._sampler_refresh_elapse_eta()
+		self._sampler_elapse_timer=wx.CallLater(1000,self._sampler_elapse_tick)
+
+
+	def _sampler_on_progress(self,current,total,basename):
+
+		self._sampler_progress_cur=current
+		self._sampler_progress_tot=total
+		rg=max(1,total)
+		self.gauge.SetRange(rg)
+		self.gauge.SetValue(min(current,rg))
+		if total<=0:
+			self.text_copying.SetLabel('')
+		elif current<=0:
+			self.text_copying.SetLabel('Preparing...')
+		else:
+			self.text_copying.SetLabel('Copying image {} of {}...'.format(current,total))
+		self._sampler_refresh_elapse_eta()
+		self.Layout()
+
+
+	def _sampler_worker(self):
+
+		def cb(cur,tot,base):
+			wx.CallAfter(self._sampler_on_progress,cur,tot,base)
+
+		try:
+			result=sample_from_pool(self.image_pool_dir,self.dataset_dir,self.n_samples,self.seed,progress_callback=cb)
+			wx.CallAfter(self._sampler_on_finished,result,None)
+		except Exception as e:
+			wx.CallAfter(self._sampler_on_finished,None,e)
+
+
+	def _sampler_set_controls_busy(self,busy):
+
+		for b in self._sampler_step_buttons:
+			b.Enable(not busy)
+		self.button_run.Enable(not busy)
+
+
+	def _sampler_on_finished(self,result,error):
+
+		self._sampler_running=False
+		self._sampler_stop_elapse_timer()
+		elapsed=time.time()-self._sampler_start_time
+		self.text_elapsed_p.SetLabel('Elapsed: '+self._fmt_hms(elapsed))
+		self.text_eta_p.SetLabel('Estimated completion: Done')
+		tot=self._sampler_progress_tot
+		rg=max(1,tot)
+		self.gauge.SetRange(rg)
+		self.gauge.SetValue(rg)
+		if tot>0:
+			self.text_copying.SetLabel('Copying image {} of {}...'.format(tot,tot))
+		else:
+			self.text_copying.SetLabel('')
+
+		if error is not None:
+			wx.MessageBox(str(error),"Bobby's Image Sampler",wx.OK|wx.ICON_ERROR)
+			self.progress_holder.Hide()
+			self._sampler_set_controls_busy(False)
+			self.Layout()
+			return
+
+		parts=[
+			'Copied: {}'.format(result['copied']),
+			'Requested: {}'.format(result['requested']),
+			'Eligible available: {}'.format(result['available']),
+		]
+		if result.get('warning'):
+			parts.append('')
+			parts.append(result['warning'])
+		msg='\n'.join(parts)
+		dlg=wx.MessageDialog(self,msg,"Bobby's Image Sampler",wx.OK|wx.ICON_INFORMATION)
+		dlg.ShowModal()
+		dlg.Destroy()
+
+		self.progress_holder.Hide()
+		self.gauge.SetValue(0)
+		self.gauge.SetRange(1)
+		self.text_copying.SetLabel('')
+		self.text_elapsed_p.SetLabel('Elapsed: 0:00:00')
+		self.text_eta_p.SetLabel('Estimated completion: Calculating...')
+
+		self.image_pool_dir=None
+		self.dataset_dir=None
+		self.n_samples=100
+		self.seed=42
+		self._sampler_set_controls_busy(False)
+		self.refresh_descriptions()
+
+
+	def run_sampler(self,event):
+
+		if self._sampler_running:
+			return
+		if not self.image_pool_dir or not self.dataset_dir:
+			wx.MessageBox('Please select both the image pool folder and the dataset folder.',"Bobby's Image Sampler",wx.OK|wx.ICON_WARNING)
+			return
+
+		self._sampler_set_controls_busy(True)
+		self.progress_holder.Show()
+		self._sampler_running=True
+		self._sampler_start_time=time.time()
+		self._sampler_progress_cur=0
+		self._sampler_progress_tot=0
+		self.gauge.SetRange(1)
+		self.gauge.SetValue(0)
+		self.text_copying.SetLabel('Starting...')
+		self.text_elapsed_p.SetLabel('Elapsed: 0:00:00')
+		self.text_eta_p.SetLabel('Estimated completion: Calculating...')
+		self._sampler_stop_elapse_timer()
+		self._sampler_refresh_elapse_eta()
+		self._sampler_elapse_timer=wx.CallLater(1000,self._sampler_elapse_tick)
+		self.Layout()
+
+		threading.Thread(target=self._sampler_worker,daemon=True).start()
 
