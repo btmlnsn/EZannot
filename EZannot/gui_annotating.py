@@ -15,6 +15,7 @@ from EZannot.sam2.sam2_image_predictor import SAM2ImagePredictor
 from .annotator import AutoAnnotation
 from .tools import read_annotation,mask_to_polygon,generate_annotation
 from .gui_main import open_or_select_page
+from .gui_merge import PanelLv2_MergeDatasets
 
 
 
@@ -104,6 +105,12 @@ class PanelLv1_AnnotationModule(wx.Panel):
 		button_autoannotate.Bind(wx.EVT_BUTTON,self.auto_annotate)
 		wx.Button.SetToolTip(button_autoannotate,'Use a trained Annotator to automatically annotate selected images for you.')
 		boxsizer.Add(button_autoannotate,0,wx.ALIGN_CENTER,10)
+		boxsizer.Add(0,5,0)
+
+		button_mergedatasets=wx.Button(panel,label='Merge Datasets',size=(300,40))
+		button_mergedatasets.Bind(wx.EVT_BUTTON,self.merge_datasets)
+		wx.Button.SetToolTip(button_mergedatasets,'Combine two folders of images and annotations into one dataset. Useful for merging batch runs or manual and auto annotations.')
+		boxsizer.Add(button_mergedatasets,0,wx.ALIGN_CENTER,10)
 		boxsizer.Add(0,50,0)
 
 		panel.SetSizer(boxsizer)
@@ -120,6 +127,11 @@ class PanelLv1_AnnotationModule(wx.Panel):
 	def auto_annotate(self,event):
 
 		open_or_select_page(self.notebook,'Annotate Automatically',lambda:PanelLv2_AutoAnnotation(self.notebook))
+
+
+	def merge_datasets(self,event):
+
+		open_or_select_page(self.notebook,'Merge Datasets',lambda:PanelLv2_MergeDatasets(self.notebook))
 
 
 
