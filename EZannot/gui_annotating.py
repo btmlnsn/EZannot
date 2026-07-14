@@ -372,6 +372,107 @@ class PanelLv2_ManualAnnotation(wx.Panel):
 
 
 
+class MiniSwitch(wx.Panel):
+	"""Small on/off switch control (wx.Switch is unavailable on this wx build)."""
+
+	def __init__(self,parent,value=False,size=(36,20)):
+
+		super().__init__(parent,size=size)
+		self._value=bool(value)
+		self._enabled=True
+		self.SetMinSize(size)
+		self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+		self.Bind(wx.EVT_PAINT,self.on_paint)
+		self.Bind(wx.EVT_LEFT_DOWN,self.on_click)
+		self.Bind(wx.EVT_SIZE,self.on_size)
+
+
+	def GetValue(self):
+
+		return self._value
+
+
+	def SetValue(self,value):
+
+		self._value=bool(value)
+		self.Refresh()
+
+
+	def Enable(self,enable=True):
+
+		self._enabled=bool(enable)
+		super().Enable(enable)
+		self.Refresh()
+
+
+	def Disable(self):
+
+		self.Enable(False)
+
+
+	def IsEnabled(self):
+
+		return self._enabled
+
+
+	def on_size(self,event):
+
+		self.Refresh()
+		event.Skip()
+
+
+	def on_click(self,event):
+
+		if not self._enabled:
+			return
+		self._value=not self._value
+		self.Refresh()
+		evt=wx.CommandEvent(wx.wxEVT_COMMAND_CHECKBOX_CLICKED,self.GetId())
+		evt.SetEventObject(self)
+		evt.SetInt(int(self._value))
+		self.ProcessEvent(evt)
+
+
+	def on_paint(self,event):
+
+		dc=wx.AutoBufferedPaintDC(self)
+		w,h=self.GetClientSize()
+		bg=self.GetParent().GetBackgroundColour()
+		if not bg.IsOk():
+			bg=wx.SystemSettings.GetColour(wx.SYS_COLOUR_FRAMEBK)
+		dc.SetBackground(wx.Brush(bg))
+		dc.Clear()
+		pad=1
+		track_h=max(12,h-2*pad)
+		track_y=(h-track_h)//2
+		radius=track_h/2
+		if not self._enabled:
+			track_color=wx.Colour(210,210,214)
+			knob_fill=wx.Colour(245,245,245)
+			knob_edge=wx.Colour(230,230,230)
+		elif self._value:
+			track_color=wx.Colour(52,199,89)  # mac-like green
+			knob_fill=wx.Colour(255,255,255)
+			knob_edge=wx.Colour(220,220,220)
+		else:
+			track_color=wx.Colour(174,174,178)
+			knob_fill=wx.Colour(255,255,255)
+			knob_edge=wx.Colour(220,220,220)
+		dc.SetBrush(wx.Brush(track_color))
+		dc.SetPen(wx.Pen(track_color))
+		dc.DrawRoundedRectangle(pad,track_y,w-2*pad,track_h,radius)
+		knob_d=track_h-2
+		knob_y=track_y+1
+		if self._value and self._enabled:
+			knob_x=w-pad-knob_d-1
+		else:
+			knob_x=pad+1
+		dc.SetBrush(wx.Brush(knob_fill))
+		dc.SetPen(wx.Pen(knob_edge))
+		dc.DrawCircle(knob_x+knob_d//2,knob_y+knob_d//2,knob_d//2)
+
+
+
 class WindowLv3_AnnotateImages(wx.Frame):
 
 	def __init__(self,parent,title,path_to_images,result_path,color_map,aug_methods,model_cp=None,model_cfg=None):
@@ -417,6 +518,7 @@ class WindowLv3_AnnotateImages(wx.Frame):
 	def init_ui(self):
 
 		panel=wx.Panel(self)
+		self.ui_panel=panel
 		vbox=wx.BoxSizer(wx.VERTICAL)
 		hbox=wx.BoxSizer(wx.HORIZONTAL)
 
@@ -441,17 +543,47 @@ class WindowLv3_AnnotateImages(wx.Frame):
 		hbox.Add(self.export_button,flag=wx.ALL,border=2)
 		vbox.Add(hbox,flag=wx.ALIGN_CENTER|wx.TOP,border=5)
 
-		filename_row=wx.BoxSizer(wx.HORIZONTAL)
-		self.filename_info_button=wx.Button(panel,label='i',size=(22,22))
+		# Single-height row 2: centered filename; switch pinned under Export.
+		self.row2_panel=wx.Panel(panel)
+		self.row2_panel.SetMinSize((-1,24))
+		row2_sizer=wx.BoxSizer(wx.HORIZONTAL)
+		row2_sizer.AddStretchSpacer(1)
+
+		filename_inner=wx.BoxSizer(wx.HORIZONTAL)
+		self.filename_info_button=wx.Button(self.row2_panel,label='i',size=(22,22))
 		self.filename_info_button.Bind(wx.EVT_BUTTON,self.show_filename_info)
 		wx.Button.SetToolTip(self.filename_info_button,'About this filename')
-		filename_row.Add(self.filename_info_button,0,wx.ALIGN_CENTER_VERTICAL|wx.RIGHT,6)
+		filename_inner.Add(self.filename_info_button,0,wx.ALIGN_CENTER_VERTICAL|wx.RIGHT,6)
 
-		self.text_filename=wx.StaticText(panel,label='',style=wx.ALIGN_LEFT|wx.ST_ELLIPSIZE_MIDDLE)
+		self.text_filename=wx.StaticText(self.row2_panel,label='',style=wx.ALIGN_LEFT|wx.ST_ELLIPSIZE_MIDDLE)
 		self.text_filename.SetMinSize((280,-1))
 		self.text_filename.SetMaxSize((480,-1))
-		filename_row.Add(self.text_filename,0,wx.ALIGN_CENTER_VERTICAL)
-		vbox.Add(filename_row,0,wx.ALIGN_CENTER|wx.TOP|wx.BOTTOM,1)
+		filename_inner.Add(self.text_filename,0,wx.ALIGN_CENTER_VERTICAL)
+
+		row2_sizer.Add(filename_inner,0,wx.ALIGN_CENTER_VERTICAL)
+		row2_sizer.AddStretchSpacer(1)
+		self.row2_panel.SetSizer(row2_sizer)
+		vbox.Add(self.row2_panel,0,wx.EXPAND|wx.TOP|wx.BOTTOM,1)
+
+		self.export_only_to_export_folder=False
+		self.export_only_label=wx.StaticText(self.row2_panel,label='JSON in Export Folder only')
+		label_font=self.text_filename.GetFont()
+		if label_font.IsOk() and label_font.GetPointSize()>1:
+			label_font=wx.Font(label_font)
+			label_font.SetPointSize(max(label_font.GetPointSize()-1,9))
+			self.export_only_label.SetFont(label_font)
+		else:
+			self.export_only_label.SetFont(wx.Font(wx.FontInfo(11)))
+		self.export_only_switch=MiniSwitch(self.row2_panel,value=False,size=(34,18))
+		self.export_only_switch.Bind(wx.EVT_CHECKBOX,self.toggle_export_only)
+		tip=(
+			'OFF (default): also write annotations.json into the original image folder.\n'
+			'ON: write annotations.json only into the export folder.'
+		)
+		wx.Window.SetToolTip(self.export_only_switch,tip)
+		wx.Window.SetToolTip(self.export_only_label,tip)
+		self._export_only_tip=tip
+		self.update_export_only_lock()
 
 		self.scrolled_canvas=wx.ScrolledWindow(panel,style=wx.VSCROLL|wx.HSCROLL)
 		self.scrolled_canvas.SetScrollRate(10,10)
@@ -470,8 +602,39 @@ class WindowLv3_AnnotateImages(wx.Frame):
 		vbox.Add(self.scrolled_canvas,proportion=1,flag=wx.EXPAND|wx.ALL,border=5)
 
 		panel.SetSizer(vbox)
+		panel.Bind(wx.EVT_SIZE,self.on_ui_panel_size)
+		self.row2_panel.Bind(wx.EVT_SIZE,self.on_ui_panel_size)
 		self.Bind(wx.EVT_CHAR_HOOK,self.on_key_press)
 		self.Show()
+		wx.CallAfter(self.reposition_export_only_controls)
+
+
+	def on_ui_panel_size(self,event):
+
+		wx.CallAfter(self.reposition_export_only_controls)
+		event.Skip()
+
+
+	def reposition_export_only_controls(self):
+
+		if not hasattr(self,'export_button') or not hasattr(self,'row2_panel'):
+			return
+		# Align label + switch on row 2, centered under Export Annotations.
+		btn_pt=self.export_button.ClientToScreen((0,0))
+		row_pt=self.row2_panel.ClientToScreen((0,0))
+		local_x=btn_pt.x-row_pt.x
+		bw=self.export_button.GetSize()[0]
+		rh=self.row2_panel.GetClientSize()[1]
+		lw,lh=self.export_only_label.GetBestSize()
+		sw,sh=self.export_only_switch.GetSize()
+		gap=6
+		total_w=lw+gap+sw
+		x=local_x+(bw-total_w)//2
+		y=max(0,(rh-max(lh,sh))//2)
+		self.export_only_label.SetPosition((x,y+(max(lh,sh)-lh)//2))
+		self.export_only_switch.SetPosition((x+lw+gap,y+(max(lh,sh)-sh)//2))
+		self.export_only_label.Raise()
+		self.export_only_switch.Raise()
 
 
 	def toggle_ai(self,event):
@@ -496,6 +659,47 @@ class WindowLv3_AnnotateImages(wx.Frame):
 				self.sam2.set_image(image)
 
 		self.canvas.SetFocus()
+
+
+	def toggle_export_only(self,event):
+
+		if not self.export_only_switch.IsEnabled():
+			self.export_only_switch.SetValue(False)
+			self.export_only_to_export_folder=False
+			self.canvas.SetFocus()
+			return
+		self.export_only_to_export_folder=self.export_only_switch.GetValue()
+		self.canvas.SetFocus()
+
+
+	def same_import_export_folder(self):
+
+		if not self.image_paths or not self.result_path:
+			return False
+		try:
+			return os.path.realpath(os.path.dirname(self.image_paths[0]))==os.path.realpath(self.result_path)
+		except OSError:
+			return os.path.normpath(os.path.dirname(self.image_paths[0]))==os.path.normpath(self.result_path)
+
+
+	def update_export_only_lock(self):
+
+		if not hasattr(self,'export_only_switch'):
+			return
+		locked=self.same_import_export_folder()
+		if locked:
+			self.export_only_switch.SetValue(False)
+			self.export_only_to_export_folder=False
+			self.export_only_switch.Disable()
+			lock_tip='Unavailable when the import folder and export folder are the same.'
+			wx.Window.SetToolTip(self.export_only_switch,lock_tip)
+			wx.Window.SetToolTip(self.export_only_label,lock_tip)
+			self.export_only_label.Enable(False)
+		else:
+			self.export_only_switch.Enable(True)
+			self.export_only_label.Enable(True)
+			wx.Window.SetToolTip(self.export_only_switch,self._export_only_tip)
+			wx.Window.SetToolTip(self.export_only_label,self._export_only_tip)
 
 
 	def update_filename_label(self):
@@ -816,8 +1020,11 @@ class WindowLv3_AnnotateImages(wx.Frame):
 			wx.MessageBox('No annotations to export.','Error',wx.ICON_ERROR)
 			return
 
+		self.update_export_only_lock()
 		generate_annotation(os.path.dirname(self.image_paths[0]),self.information,self.result_path,self.result_path,self.aug_methods,self.color_map)
-		generate_annotation(os.path.dirname(self.image_paths[0]),self.information,os.path.dirname(self.image_paths[0]),self.result_path,[],self.color_map)
+		export_only=self.export_only_to_export_folder and not self.same_import_export_folder()
+		if not export_only:
+			generate_annotation(os.path.dirname(self.image_paths[0]),self.information,os.path.dirname(self.image_paths[0]),self.result_path,[],self.color_map)
 
 		wx.MessageBox('Annotations exported successfully.','Success',wx.ICON_INFORMATION)
 
