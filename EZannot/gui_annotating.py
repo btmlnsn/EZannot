@@ -487,6 +487,9 @@ class MiniSwitch(wx.Panel):
 
 class WindowLv3_AnnotateImages(wx.Frame):
 
+	QUEUE_ORDER=('pending','annotated','skipped')
+	QUEUE_TITLES={'pending':'Pending','annotated':'Annotated','skipped':'Skipped'}
+
 	def __init__(self,parent,title,path_to_images,result_path,color_map,aug_methods,model_cp=None,model_cfg=None):
 
 		monitor=get_monitors()[0]
@@ -515,8 +518,14 @@ class WindowLv3_AnnotateImages(wx.Frame):
 		self.min_scale=0.25
 		self.max_scale=8.0
 		self.zoom_step=1.25
+		self.active_queue='pending'
+		self._queue_last_path={q:None for q in self.QUEUE_ORDER}
 
 		self.init_ui()
+		self.active_queue=self._default_queue()
+		start_paths=[p for p in self.image_paths if self._structural_class(os.path.basename(p))==self.active_queue]
+		if start_paths:
+			self.current_image_id=self.image_paths.index(start_paths[0])
 		self.load_current_image()
 
 
@@ -555,6 +564,15 @@ class WindowLv3_AnnotateImages(wx.Frame):
 		hbox.Add(self.export_button,flag=wx.ALL,border=2)
 		vbox.Add(hbox,flag=wx.ALIGN_CENTER|wx.TOP,border=5)
 
+		queue_box=wx.BoxSizer(wx.HORIZONTAL)
+		self.queue_buttons={}
+		for queue_id in self.QUEUE_ORDER:
+			btn=wx.ToggleButton(panel,label=f'{self.QUEUE_TITLES[queue_id]} (0)',size=(160,28))
+			btn.Bind(wx.EVT_TOGGLEBUTTON,lambda event,q=queue_id:self.on_queue_select(q))
+			queue_box.Add(btn,flag=wx.ALL,border=2)
+			self.queue_buttons[queue_id]=btn
+		vbox.Add(queue_box,flag=wx.ALIGN_CENTER|wx.TOP,border=2)
+
 		# Single-height row 2: centered filename; switch pinned under Export.
 		self.row2_panel=wx.Panel(panel)
 		self.row2_panel.SetMinSize((-1,24))
@@ -568,8 +586,8 @@ class WindowLv3_AnnotateImages(wx.Frame):
 		filename_inner.Add(self.filename_info_button,0,wx.ALIGN_CENTER_VERTICAL|wx.RIGHT,6)
 
 		self.text_filename=wx.StaticText(self.row2_panel,label='',style=wx.ALIGN_LEFT|wx.ST_ELLIPSIZE_MIDDLE)
-		self.text_filename.SetMinSize((280,-1))
-		self.text_filename.SetMaxSize((480,-1))
+		self.text_filename.SetMinSize((320,-1))
+		self.text_filename.SetMaxSize((560,-1))
 		filename_inner.Add(self.text_filename,0,wx.ALIGN_CENTER_VERTICAL)
 
 		row2_sizer.Add(filename_inner,0,wx.ALIGN_CENTER_VERTICAL)
@@ -714,14 +732,231 @@ class WindowLv3_AnnotateImages(wx.Frame):
 			wx.Window.SetToolTip(self.export_only_label,self._export_only_tip)
 
 
+	def current_image_name(self):
+
+		if not self.image_paths:
+			return None
+		if self.current_image_id<0 or self.current_image_id>=len(self.image_paths):
+			return None
+		return os.path.basename(self.image_paths[self.current_image_id])
+
+
+	def _polygon_count(self,name):
+
+		info=self.information.get(name)
+		if not info:
+			return 0
+		return len(info.get('polygons',[]))
+
+
+	def _ensure_image_info(self,name):
+
+		if name not in self.information:
+			self.information[name]={'polygons':[],'class_names':[]}
+		return self.information[name]
+
+
+	def _image_record(self,name):
+
+		return self.information.get(name,{'polygons':[],'class_names':[]})
+
+
+	def _drop_empty_image_info(self,name):
+
+		"""Remove an image from information when it has no committed polygons (true Pending)."""
+
+		if name in self.information and self._polygon_count(name)==0:
+			del self.information[name]
+
+
+	def _mark_image_skipped(self,name):
+
+		"""Persist an empty visit so Export treats the image as Skipped."""
+
+		if self._polygon_count(name)>0:
+			return
+		self._ensure_image_info(name)
+
+
+	def _current_is_blank(self):
+
+		name=self.current_image_name()
+		if name is None or self.current_image is None:
+			return False
+		return self._polygon_count(name)==0
+
+
+	def _structural_class(self,name):
+
+		n_poly=self._polygon_count(name)
+		if n_poly>0:
+			return 'annotated'
+		if name in self.information:
+			return 'skipped'
+		return 'pending'
+
+
+	def classify_image(self,name):
+
+		"""Live queue class for counts (current empty image stays Pending)."""
+
+		n_poly=self._polygon_count(name)
+		if n_poly>0:
+			return 'annotated'
+		if name==self.current_image_name():
+			return 'pending'
+		if name in self.information:
+			return 'skipped'
+		return 'pending'
+
+
+	def _in_nav_queue(self,name,queue):
+
+		"""Membership for Prev/Next within a queue."""
+
+		n_poly=self._polygon_count(name)
+		if queue=='annotated':
+			return n_poly>0
+		if queue=='skipped':
+			# Include current empty so Skipped remains browsable while opened.
+			return name in self.information and n_poly==0
+		# pending
+		if n_poly>0:
+			return False
+		if name not in self.information:
+			return True
+		return name==self.current_image_name()
+
+
+	def queue_paths(self,queue=None):
+
+		queue=self.active_queue if queue is None else queue
+		return [p for p in self.image_paths if self._in_nav_queue(os.path.basename(p),queue)]
+
+
+	def queue_counts(self):
+
+		counts={q:0 for q in self.QUEUE_ORDER}
+		for path in self.image_paths:
+			counts[self.classify_image(os.path.basename(path))]+=1
+		return counts
+
+
+	def _default_queue(self):
+
+		counts={q:0 for q in self.QUEUE_ORDER}
+		for path in self.image_paths:
+			counts[self._structural_class(os.path.basename(path))]+=1
+		for queue_id in self.QUEUE_ORDER:
+			if counts[queue_id]>0:
+				return queue_id
+		return 'pending'
+
+
+	def refresh_queue_ui(self):
+
+		if not hasattr(self,'queue_buttons'):
+			return
+		counts=self.queue_counts()
+		for queue_id,btn in self.queue_buttons.items():
+			btn.SetLabel(f'{self.QUEUE_TITLES[queue_id]} ({counts[queue_id]})')
+			btn.SetValue(queue_id==self.active_queue)
+		# Keep Next available for a blank image at end-of-queue so Next can still skip it.
+		can_prev=self._prev_path_in_active_queue() is not None
+		can_next=(
+			self._next_path_in_active_queue() is not None
+			or (self.current_image is not None and self._current_is_blank())
+		)
+		self.prev_button.Enable(can_prev)
+		self.next_button.Enable(can_next)
+		self.update_filename_label()
+
+
+	def on_queue_select(self,queue_id):
+
+		if queue_id==self.active_queue:
+			self.queue_buttons[queue_id].SetValue(True)
+			self.canvas.SetFocus()
+			return
+		if self.image_paths and 0<=self.current_image_id<len(self.image_paths):
+			self._queue_last_path[self.active_queue]=self.image_paths[self.current_image_id]
+		self.active_queue=queue_id
+		paths=self.queue_paths()
+		last=self._queue_last_path.get(queue_id)
+		if last in paths:
+			self.current_image_id=self.image_paths.index(last)
+			self.load_current_image()
+		elif paths:
+			self.current_image_id=self.image_paths.index(paths[0])
+			self.load_current_image()
+		else:
+			self.refresh_queue_ui()
+		self.canvas.SetFocus()
+
+
+	def _next_path_in_active_queue(self):
+
+		"""Next path in the active queue after the current image (session order)."""
+
+		if not self.image_paths:
+			return None
+		path=self.image_paths[self.current_image_id]
+		paths=self.queue_paths()
+		if path in paths:
+			index=paths.index(path)
+			if index<len(paths)-1:
+				return paths[index+1]
+			return None
+		# Current left the active queue (annotated / cleared) — keep walking that queue.
+		for candidate in self.image_paths[self.current_image_id+1:]:
+			if self._in_nav_queue(os.path.basename(candidate),self.active_queue):
+				return candidate
+		return None
+
+
+	def _prev_path_in_active_queue(self):
+
+		"""Previous path in the active queue before the current image (session order)."""
+
+		if not self.image_paths:
+			return None
+		path=self.image_paths[self.current_image_id]
+		paths=self.queue_paths()
+		if path in paths:
+			index=paths.index(path)
+			if index>0:
+				return paths[index-1]
+			return None
+		for candidate in reversed(self.image_paths[:self.current_image_id]):
+			if self._in_nav_queue(os.path.basename(candidate),self.active_queue):
+				return candidate
+		return None
+
+
+	def _after_polygons_changed(self):
+
+		# Stay on this image; Next advances within the queue the user was browsing.
+		self.refresh_queue_ui()
+
+
 	def update_filename_label(self):
 
+		title=self.QUEUE_TITLES.get(self.active_queue,'Pending')
 		if not self.image_paths:
 			self.text_filename.SetLabel('Filename: No images')
 			return
-		name=os.path.basename(self.image_paths[self.current_image_id])
-		self.text_filename.SetLabel(f'Filename: {name} ({self.current_image_id+1} / {len(self.image_paths)})')
-
+		if self.current_image is None or self.current_image_id<0 or self.current_image_id>=len(self.image_paths):
+			self.text_filename.SetLabel(f'No {title.lower()} images')
+			return
+		path=self.image_paths[self.current_image_id]
+		name=os.path.basename(path)
+		paths=self.queue_paths()
+		if path in paths:
+			index=paths.index(path)+1
+			self.text_filename.SetLabel(f'Filename: {name} ({index} / {len(paths)}) · {title}')
+		else:
+			# Still viewing an image that just changed class; Next continues this queue.
+			self.text_filename.SetLabel(f'Filename: {name} · {title}')
 
 	def show_filename_info(self,event):
 
@@ -766,18 +1001,19 @@ class WindowLv3_AnnotateImages(wx.Frame):
 
 		if not self.image_paths:
 			self.current_image=None
-			self.update_filename_label()
+			self.refresh_queue_ui()
 			self.canvas.Refresh()
 			return
 
 		if self.current_image_id>=len(self.image_paths):
 			self.current_image_id=len(self.image_paths)-1
+		if self.current_image_id<0:
+			self.current_image_id=0
 
 		path=self.image_paths[self.current_image_id]
 		self.current_image=wx.Image(path,wx.BITMAP_TYPE_ANY)
-		image_name=os.path.basename(path)
-		if image_name not in self.information:
-			self.information[image_name]={'polygons':[],'class_names':[]}
+		# Do not write into information on open — blank opens stay Pending until Next (skip)
+		# or an annotation is committed.
 		self.current_polygon=[]
 		self.foreground_points=[]
 		self.background_points=[]
@@ -793,22 +1029,36 @@ class WindowLv3_AnnotateImages(wx.Frame):
 			self.sam2=self.sam2_model()
 			self.sam2.set_image(image)
 
-		self.update_filename_label()
+		self._queue_last_path[self.active_queue]=path
+		self.refresh_queue_ui()
 
 
 	def previous_image(self,event):
 
-		if self.image_paths and self.current_image_id>0:
-			self.current_image_id-=1
+		# Prev does not skip — a blank open stays Pending.
+		prev_path=self._prev_path_in_active_queue()
+		if prev_path is not None:
+			self.current_image_id=self.image_paths.index(prev_path)
 			self.load_current_image()
 		self.canvas.SetFocus()
 
 
 	def next_image(self,event):
 
-		if self.image_paths and self.current_image_id<len(self.image_paths)-1:
-			self.current_image_id+=1
+		if not self.image_paths or self.current_image is None:
+			self.canvas.SetFocus()
+			return
+		path=self.image_paths[self.current_image_id]
+		name=os.path.basename(path)
+		next_path=self._next_path_in_active_queue()
+		# Next without annotations is the skip action (even on the last image).
+		if self._polygon_count(name)==0:
+			self._mark_image_skipped(name)
+		if next_path is not None:
+			self.current_image_id=self.image_paths.index(next_path)
 			self.load_current_image()
+		else:
+			self.refresh_queue_ui()
 		self.canvas.SetFocus()
 
 
@@ -816,10 +1066,27 @@ class WindowLv3_AnnotateImages(wx.Frame):
 
 		if self.image_paths:
 			path=self.image_paths[self.current_image_id]
+			queue_before=self.queue_paths()
+			qi=queue_before.index(path) if path in queue_before else 0
 			self.image_paths.remove(path)
 			image_name=os.path.basename(path)
-			del self.information[image_name]
-			self.load_current_image()
+			if image_name in self.information:
+				del self.information[image_name]
+			remaining=[p for p in queue_before if p!=path]
+			if remaining:
+				if qi>0:
+					target=remaining[qi-1]
+				else:
+					target=remaining[0]
+				self.current_image_id=self.image_paths.index(target)
+				self.load_current_image()
+			else:
+				# Active queue empty (and/or session empty): do not open another queue's image.
+				if self.current_image_id>=len(self.image_paths):
+					self.current_image_id=max(len(self.image_paths)-1,0)
+				self.current_image=None
+				self.refresh_queue_ui()
+				self.canvas.Refresh()
 		self.canvas.SetFocus()
 
 
@@ -833,8 +1100,9 @@ class WindowLv3_AnnotateImages(wx.Frame):
 		scaled_image=self.current_image.Scale(int(w*self.scale),int(h*self.scale),wx.IMAGE_QUALITY_HIGH)
 		dc.DrawBitmap(wx.Bitmap(scaled_image),0,0,True)
 		image_name=os.path.basename(self.image_paths[self.current_image_id])
-		polygons=self.information[image_name]['polygons']
-		class_names=self.information[image_name]['class_names']
+		record=self._image_record(image_name)
+		polygons=record['polygons']
+		class_names=record['class_names']
 
 		if len(polygons)>0:
 			for i,polygon in enumerate(polygons):
@@ -878,7 +1146,7 @@ class WindowLv3_AnnotateImages(wx.Frame):
 		if self.start_modify:
 
 			image_name=os.path.basename(self.image_paths[self.current_image_id])
-			for i,polygon in enumerate(self.information[image_name]['polygons']):
+			for i,polygon in enumerate(self._image_record(image_name)['polygons']):
 				for j,(px,py) in enumerate(polygon):
 					if abs(px-int(x/self.scale))<5/self.scale and abs(py-int(y/self.scale))<5/self.scale:
 						self.selected_point=(polygon,j,i)
@@ -925,8 +1193,10 @@ class WindowLv3_AnnotateImages(wx.Frame):
 
 				to_delete=[]
 				image_name=os.path.basename(self.image_paths[self.current_image_id])
+				if image_name not in self.information:
+					self.canvas.Refresh()
+					return
 				polygons=self.information[image_name]['polygons']
-				class_names=self.information[image_name]['class_names']
 				if len(polygons)>0:
 					for i,polygon in enumerate(polygons):
 						x_max=max(x for x,y in polygon)
@@ -939,6 +1209,8 @@ class WindowLv3_AnnotateImages(wx.Frame):
 					for i in sorted(to_delete,reverse=True):
 						del self.information[image_name]['polygons'][i]
 						del self.information[image_name]['class_names'][i]
+					self._drop_empty_image_info(image_name)
+					self._after_polygons_changed()
 
 		self.canvas.Refresh()
 
@@ -953,18 +1225,23 @@ class WindowLv3_AnnotateImages(wx.Frame):
 				current_index=classnames.index(self.current_classname)
 				dialog=wx.SingleChoiceDialog(self,message='Choose object class name',caption='Class Name',choices=classnames)
 				dialog.SetSelection(current_index)
+				committed=False
 				if dialog.ShowModal()==wx.ID_OK:
 					self.current_classname=dialog.GetStringSelection()
 					if len(self.current_polygon)>0:
 						self.current_polygon.append(self.current_polygon[0])
 						image_name=os.path.basename(self.image_paths[self.current_image_id])
-						self.information[image_name]['polygons'].append(self.current_polygon)
-						self.information[image_name]['class_names'].append(self.current_classname)
+						record=self._ensure_image_info(image_name)
+						record['polygons'].append(self.current_polygon)
+						record['class_names'].append(self.current_classname)
+						committed=True
 				dialog.Destroy()
 				self.current_polygon=[]
 				self.foreground_points=[]
 				self.background_points=[]
 				self.canvas.Refresh()
+				if committed:
+					self._after_polygons_changed()
 		elif key_code==wx.WXK_LEFT:
 			self.previous_image(None)
 		elif key_code==wx.WXK_RIGHT:
@@ -1026,10 +1303,42 @@ class WindowLv3_AnnotateImages(wx.Frame):
 		self.canvas.Refresh()
 
 
+	def _resolve_blank_current_for_export(self):
+
+		"""Ask whether the open blank image is a Skip or should stay Pending."""
+
+		if not self._current_is_blank():
+			return True
+		name=self.current_image_name()
+		dialog=wx.MessageDialog(
+			self,
+			f'Current image "{name}" has no annotations.\n\n'
+			'Skip it (save as empty) or leave it pending for later?',
+			'Current image unannotated',
+			wx.YES_NO|wx.CANCEL|wx.ICON_QUESTION
+		)
+		dialog.SetYesNoCancelLabels('Skip image','Leave for later','Cancel')
+		choice=dialog.ShowModal()
+		dialog.Destroy()
+		if choice==wx.ID_CANCEL:
+			return False
+		if choice==wx.ID_YES:
+			self._mark_image_skipped(name)
+		else:
+			self._drop_empty_image_info(name)
+		self.refresh_queue_ui()
+		return True
+
+
 	def export_annotations(self,event):
+
+		if not self._resolve_blank_current_for_export():
+			self.canvas.SetFocus()
+			return
 
 		if not self.information:
 			wx.MessageBox('No annotations to export.','Error',wx.ICON_ERROR)
+			self.canvas.SetFocus()
 			return
 
 		self.update_export_only_lock()
@@ -1039,7 +1348,7 @@ class WindowLv3_AnnotateImages(wx.Frame):
 			generate_annotation(os.path.dirname(self.image_paths[0]),self.information,os.path.dirname(self.image_paths[0]),self.result_path,[],self.color_map)
 
 		wx.MessageBox('Annotations exported successfully.','Success',wx.ICON_INFORMATION)
-
+		self.refresh_queue_ui()
 		self.canvas.SetFocus()
 
 
