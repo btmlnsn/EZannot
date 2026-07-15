@@ -612,6 +612,11 @@ class WindowLv3_AnnotateImages(wx.Frame):
 		self.current_polygon=[]
 		self.current_classname=list(self.color_map.keys())[0]
 		self.information=read_annotation(os.path.dirname(self.image_paths[0]),color_map=self.color_map)
+		# Empty COCO image rows (no polygons) were previously exported as skips.
+		self.skipped_images={
+			name for name,info in self.information.items()
+			if len(info.get('polygons',[]))==0
+			}
 		self.foreground_points=[]
 		self.background_points=[]
 		self.selected_point=None
@@ -877,18 +882,20 @@ class WindowLv3_AnnotateImages(wx.Frame):
 
 	def _drop_empty_image_info(self,name):
 
-		"""Remove an image from information when it has no committed polygons (true Pending)."""
+		"""Clear empty state so the image is Pending (not Skipped)."""
 
+		self.skipped_images.discard(name)
 		if name in self.information and self._polygon_count(name)==0:
 			del self.information[name]
 
 
 	def _mark_image_skipped(self,name):
 
-		"""Persist an empty visit so Export treats the image as Skipped."""
+		"""Mark skipped only via Next / Export Skip; Export writes an empty COCO image row."""
 
-		if self._polygon_count(name)>0:
+		if name is None or self._polygon_count(name)>0:
 			return
+		self.skipped_images.add(name)
 		self._ensure_image_info(name)
 
 
@@ -905,41 +912,23 @@ class WindowLv3_AnnotateImages(wx.Frame):
 		n_poly=self._polygon_count(name)
 		if n_poly>0:
 			return 'annotated'
-		if name in self.information:
+		if name in self.skipped_images:
 			return 'skipped'
 		return 'pending'
 
 
 	def classify_image(self,name):
 
-		"""Live queue class for counts (current empty image stays Pending)."""
+		"""Queue class for live counts (same rules as navigation)."""
 
-		n_poly=self._polygon_count(name)
-		if n_poly>0:
-			return 'annotated'
-		if name==self.current_image_name():
-			return 'pending'
-		if name in self.information:
-			return 'skipped'
-		return 'pending'
+		return self._structural_class(name)
 
 
 	def _in_nav_queue(self,name,queue):
 
 		"""Membership for Prev/Next within a queue."""
 
-		n_poly=self._polygon_count(name)
-		if queue=='annotated':
-			return n_poly>0
-		if queue=='skipped':
-			# Include current empty so Skipped remains browsable while opened.
-			return name in self.information and n_poly==0
-		# pending
-		if n_poly>0:
-			return False
-		if name not in self.information:
-			return True
-		return name==self.current_image_name()
+		return self._structural_class(name)==queue
 
 
 	def queue_paths(self,queue=None):
@@ -1208,6 +1197,7 @@ class WindowLv3_AnnotateImages(wx.Frame):
 			qi=queue_before.index(path) if path in queue_before else 0
 			self.image_paths.remove(path)
 			image_name=os.path.basename(path)
+			self.skipped_images.discard(image_name)
 			if image_name in self.information:
 				del self.information[image_name]
 			remaining=[p for p in queue_before if p!=path]
@@ -1372,6 +1362,7 @@ class WindowLv3_AnnotateImages(wx.Frame):
 						record=self._ensure_image_info(image_name)
 						record['polygons'].append(self.current_polygon)
 						record['class_names'].append(self.current_classname)
+						self.skipped_images.discard(image_name)
 						committed=True
 				dialog.Destroy()
 				self.current_polygon=[]
@@ -1443,11 +1434,13 @@ class WindowLv3_AnnotateImages(wx.Frame):
 
 	def _resolve_blank_current_for_export(self):
 
-		"""Ask whether the open blank image is a Skip or should stay Pending."""
+		"""Ask whether the open blank Pending image is a Skip or should stay Pending."""
 
 		if not self._current_is_blank():
 			return True
 		name=self.current_image_name()
+		if name in self.skipped_images:
+			return True
 		dialog=wx.MessageDialog(
 			self,
 			f'Current image "{name}" has no annotations.\n\n'
@@ -1473,6 +1466,10 @@ class WindowLv3_AnnotateImages(wx.Frame):
 		if not self._resolve_blank_current_for_export():
 			self.canvas.SetFocus()
 			return
+
+		for name in list(self.skipped_images):
+			if self._polygon_count(name)==0:
+				self._ensure_image_info(name)
 
 		if not self.information:
 			wx.MessageBox('No annotations to export.','Error',wx.ICON_ERROR)
