@@ -52,6 +52,70 @@ FILENAME_INFO_TEXT=(
 	'Example: trial01_2000_rot3.jpg → still frame 2000.'
 )
 
+MANUAL_ANNOTATION_HELP_TEXT=(
+	'Export when you pause. Closing without Export loses unsaved work. '
+	'Export overwrites annotations.json.\n'
+	'\nBUTTONS\n'
+	'• AI Help: turn AI drawing assistance on/off (needs SAM2 set up).\n'
+	'• Prev: previous image in the current pile. Does not skip.\n'
+	'• Next: next image. Blank images become Skipped.\n'
+	'• Delete: remove from this session only (file stays on disk).\n'
+	'• Export Annotations: save annotations.json. Nothing is saved '
+	'until you export.\n'
+	'\n'
+	'JSON in Export Folder only: Off also writes next to the originals; '
+	'On writes only in the export folder. Locked if both folders match.\n'
+	'\n'
+	'QUEUES (Pending / Annotated / Skipped)\n'
+	'• Pending: still to do\n'
+	'• Annotated: has at least one outline\n'
+	'• Skipped: you pressed Next (or chose Skip on export) with no outlines\n'
+	'\n'
+	'Click a queue to work only in that pile. Use the list icon to search, '
+	'jump, or copy filenames. Opening an image does not skip it; Next on a '
+	'blank image does.\n'
+	'\n'
+	'DRAWING (AI Help off)\n'
+	'• Left-click: add corners\n'
+	'• Right-click: undo a corner, or delete an existing outline\n'
+	'• Enter: finish (≥3 points) and pick a type\n'
+	'• Esc: cancel current shape\n'
+	'\n'
+	'DRAWING (AI Help on)\n'
+	'• Left-click: include points\n'
+	'• Right-click: exclude points\n'
+	'• Enter: save and pick a type\n'
+	'• Esc: clear and start over\n'
+	'\n'
+	'SHORTCUTS\n'
+	'• Shift: edit mode (drag corners; zoom off)\n'
+	'• Space: show/hide type names\n'
+	'• Mouse wheel: zoom\n'
+	'• Left/Right arrows: Prev / Next\n'
+	'\n'
+)
+
+
+def show_manual_annotation_help(parent):
+
+	"""Scrollable help dialog for the manual annotator controls."""
+
+	dialog=wx.Dialog(parent,title='How to manually annotate',size=(480,520))
+	sizer=wx.BoxSizer(wx.VERTICAL)
+	text=wx.TextCtrl(
+		dialog,
+		value=MANUAL_ANNOTATION_HELP_TEXT,
+		style=wx.TE_MULTILINE|wx.TE_READONLY|wx.TE_WORDWRAP|wx.BORDER_NONE
+		)
+	text.SetBackgroundColour(dialog.GetBackgroundColour())
+	sizer.Add(text,1,wx.EXPAND|wx.ALL,12)
+	ok_button=wx.Button(dialog,wx.ID_OK,label='OK')
+	sizer.Add(ok_button,0,wx.ALIGN_RIGHT|wx.RIGHT|wx.BOTTOM,12)
+	dialog.SetSizer(sizer)
+	dialog.CentreOnParent()
+	dialog.ShowModal()
+	dialog.Destroy()
+
 
 
 class ColorPicker(wx.Dialog):
@@ -652,6 +716,12 @@ class WindowLv3_AnnotateImages(wx.Frame):
 		vbox=wx.BoxSizer(wx.VERTICAL)
 		hbox=wx.BoxSizer(wx.HORIZONTAL)
 
+		self.help_button=wx.Button(panel,label='?',size=(30,30))
+		self.help_button.Bind(wx.EVT_BUTTON,self.show_help)
+		wx.Button.SetToolTip(self.help_button,'How to use the manual annotator')
+		hbox.Add(self.help_button,flag=wx.TOP|wx.BOTTOM|wx.LEFT|wx.ALIGN_CENTER_VERTICAL,border=2)
+		hbox.AddSpacer(10)
+
 		self.ai_button=wx.ToggleButton(panel,label='AI Help: OFF',size=(200,30))
 		self.ai_button.Bind(wx.EVT_TOGGLEBUTTON,self.toggle_ai)
 		hbox.Add(self.ai_button,flag=wx.ALL,border=2)
@@ -1099,6 +1169,12 @@ class WindowLv3_AnnotateImages(wx.Frame):
 		dialog.CentreOnParent()
 		dialog.ShowModal()
 		dialog.Destroy()
+		self.canvas.SetFocus()
+
+
+	def show_help(self,event):
+
+		show_manual_annotation_help(self)
 		self.canvas.SetFocus()
 
 
