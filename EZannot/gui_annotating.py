@@ -485,6 +485,110 @@ class MiniSwitch(wx.Panel):
 
 
 
+class QueueListDialog(wx.Dialog):
+
+	"""Scrollable, searchable list of images in one annotator queue."""
+
+	def __init__(self,parent,queue_title,paths):
+
+		super().__init__(parent,title=f'{queue_title} images',size=(480,520))
+		self._all_paths=list(paths)
+		self._visible_paths=[]
+		self.selected_path=None
+
+		root=wx.BoxSizer(wx.VERTICAL)
+
+		self.search=wx.SearchCtrl(self,style=wx.TE_PROCESS_ENTER)
+		self.search.SetDescriptiveText('Search filenames…')
+		self.search.ShowCancelButton(True)
+		self.search.Bind(wx.EVT_TEXT,self.on_filter)
+		self.search.Bind(wx.EVT_SEARCHCTRL_CANCEL_BTN,self.on_clear_search)
+		self.search.Bind(wx.EVT_TEXT_ENTER,self.on_activate)
+		root.Add(self.search,0,wx.EXPAND|wx.ALL,10)
+
+		self.listbox=wx.ListBox(self,style=wx.LB_SINGLE)
+		self.listbox.Bind(wx.EVT_LISTBOX_DCLICK,self.on_activate)
+		self.listbox.Bind(wx.EVT_KEY_DOWN,self.on_list_key)
+		root.Add(self.listbox,1,wx.EXPAND|wx.LEFT|wx.RIGHT,10)
+
+		self.status=wx.StaticText(self,label='')
+		root.Add(self.status,0,wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP,10)
+
+		buttons=wx.BoxSizer(wx.HORIZONTAL)
+		copy_btn=wx.Button(self,label='Copy all')
+		copy_btn.Bind(wx.EVT_BUTTON,self.on_copy_all)
+		wx.Button.SetToolTip(copy_btn,'Copy the filenames currently shown in the list')
+		buttons.Add(copy_btn,0,wx.RIGHT,8)
+		buttons.AddStretchSpacer(1)
+		go_btn=wx.Button(self,label='Go to image')
+		go_btn.Bind(wx.EVT_BUTTON,self.on_activate)
+		cancel_btn=wx.Button(self,wx.ID_CANCEL,label='Close')
+		buttons.Add(go_btn,0,wx.RIGHT,8)
+		buttons.Add(cancel_btn,0)
+		root.Add(buttons,0,wx.EXPAND|wx.ALL,10)
+
+		self.SetSizer(root)
+		self.refill('')
+		self.search.SetFocus()
+
+
+	def on_clear_search(self,event):
+
+		self.search.ChangeValue('')
+		self.refill('')
+
+
+	def on_filter(self,event):
+
+		self.refill(self.search.GetValue())
+
+
+	def refill(self,query):
+
+		needle=query.strip().lower()
+		self.listbox.Clear()
+		self._visible_paths=[]
+		for path in self._all_paths:
+			name=os.path.basename(path)
+			if needle and needle not in name.lower():
+				continue
+			self._visible_paths.append(path)
+			self.listbox.Append(name)
+		total=len(self._all_paths)
+		shown=len(self._visible_paths)
+		if needle:
+			self.status.SetLabel(f'Showing {shown} of {total}')
+		else:
+			self.status.SetLabel(f'{shown} image{"s" if shown!=1 else ""}')
+
+
+	def on_list_key(self,event):
+
+		if event.GetKeyCode() in (wx.WXK_RETURN,wx.WXK_NUMPAD_ENTER):
+			self.on_activate(event)
+		else:
+			event.Skip()
+
+
+	def on_activate(self,event):
+
+		index=self.listbox.GetSelection()
+		if index==wx.NOT_FOUND or index<0 or index>=len(self._visible_paths):
+			return
+		self.selected_path=self._visible_paths[index]
+		self.EndModal(wx.ID_OK)
+
+
+	def on_copy_all(self,event):
+
+		lines=[os.path.basename(p) for p in self._visible_paths]
+		text='\n'.join(lines)
+		if wx.TheClipboard.Open():
+			wx.TheClipboard.SetData(wx.TextDataObject(text))
+			wx.TheClipboard.Close()
+
+
+
 class WindowLv3_AnnotateImages(wx.Frame):
 
 	QUEUE_ORDER=('pending','annotated','skipped')
@@ -566,12 +670,22 @@ class WindowLv3_AnnotateImages(wx.Frame):
 
 		queue_box=wx.BoxSizer(wx.HORIZONTAL)
 		self.queue_buttons={}
-		for queue_id in self.QUEUE_ORDER:
-			btn=wx.ToggleButton(panel,label=f'{self.QUEUE_TITLES[queue_id]} (0)',size=(160,28))
+		self.queue_list_buttons={}
+		for i,queue_id in enumerate(self.QUEUE_ORDER):
+			# Tight [toggle ☰] pair — plain glyph, no button chrome.
+			pair=wx.BoxSizer(wx.HORIZONTAL)
+			btn=wx.ToggleButton(panel,label=f'{self.QUEUE_TITLES[queue_id]} (0)',size=(118,26))
 			btn.Bind(wx.EVT_TOGGLEBUTTON,lambda event,q=queue_id:self.on_queue_select(q))
-			queue_box.Add(btn,flag=wx.ALL,border=2)
+			pair.Add(btn,0,wx.ALIGN_CENTER_VERTICAL)
 			self.queue_buttons[queue_id]=btn
-		vbox.Add(queue_box,flag=wx.ALIGN_CENTER|wx.TOP,border=2)
+			list_icon=wx.StaticText(panel,label='☰')
+			list_icon.SetCursor(wx.Cursor(wx.CURSOR_HAND))
+			list_icon.Bind(wx.EVT_LEFT_DOWN,lambda event,q=queue_id:self.show_queue_list(q))
+			wx.Window.SetToolTip(list_icon,f'Browse / search {self.QUEUE_TITLES[queue_id]} images')
+			pair.Add(list_icon,0,wx.ALIGN_CENTER_VERTICAL|wx.LEFT,5)
+			self.queue_list_buttons[queue_id]=list_icon
+			queue_box.Add(pair,0,wx.ALIGN_CENTER_VERTICAL|wx.LEFT,0 if i==0 else 10)
+		vbox.Add(queue_box,flag=wx.ALIGN_CENTER|wx.TOP,border=4)
 
 		# Single-height row 2: centered filename; switch pinned under Export.
 		self.row2_panel=wx.Panel(panel)
@@ -892,6 +1006,30 @@ class WindowLv3_AnnotateImages(wx.Frame):
 		else:
 			self.refresh_queue_ui()
 		self.canvas.SetFocus()
+
+
+	def show_queue_list(self,queue_id):
+
+		title=self.QUEUE_TITLES[queue_id]
+		paths=self.queue_paths(queue_id)
+		dialog=QueueListDialog(self,title,paths)
+		if dialog.ShowModal()==wx.ID_OK and dialog.selected_path:
+			self.go_to_queue_path(queue_id,dialog.selected_path)
+		dialog.Destroy()
+		self.canvas.SetFocus()
+
+
+	def go_to_queue_path(self,queue_id,path):
+
+		"""Open a path from a queue list without treating the open as a skip."""
+
+		if path not in self.image_paths:
+			return
+		if self.image_paths and 0<=self.current_image_id<len(self.image_paths):
+			self._queue_last_path[self.active_queue]=self.image_paths[self.current_image_id]
+		self.active_queue=queue_id
+		self.current_image_id=self.image_paths.index(path)
+		self.load_current_image()
 
 
 	def _next_path_in_active_queue(self):
