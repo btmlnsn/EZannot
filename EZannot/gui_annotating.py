@@ -59,6 +59,9 @@ MANUAL_ANNOTATION_HELP_TEXT=(
 	'• AI Help: turn AI drawing assistance on/off (needs SAM2 set up).\n'
 	'• Prev: previous image in the current pile. Does not skip.\n'
 	'• Next: next image. Blank images become Skipped.\n'
+	'• To Review: flag the current image for a later fix pass.\n'
+	'• ✓: mark the current Review image done; it returns to Annotated / '
+	'Pending / Skipped.\n'
 	'• Delete: remove from this session only (file stays on disk).\n'
 	'• Export Annotations: save annotations.json. Nothing is saved '
 	'until you export.\n'
@@ -66,14 +69,19 @@ MANUAL_ANNOTATION_HELP_TEXT=(
 	'JSON in Export Folder only: Off also writes next to the originals; '
 	'On writes only in the export folder. Locked if both folders match.\n'
 	'\n'
-	'QUEUES (Pending / Annotated / Skipped)\n'
+	'QUEUES (Pending / Annotated / Review / Skipped)\n'
 	'• Pending: still to do\n'
-	'• Annotated: has at least one outline\n'
+	'• Annotated: has at least one outline (optional per-class count filter)\n'
+	'• Review: flagged this session for a later fix pass (not saved as its own JSON state)\n'
 	'• Skipped: you pressed Next (or chose Skip on export) with no outlines\n'
 	'\n'
 	'Click a queue to work only in that pile. Use the list icon to search, '
-	'jump, or copy filenames. Opening an image does not skip it; Next on a '
-	'blank image does.\n'
+	'jump, or copy filenames. On Annotated, use the filter control to require '
+	'exact or min/max counts per object type (Any = ignore that type). '
+	'If a filter matches nothing, you get a warning and Annotated shows 0 in red. '
+	'Use To Review to flag the current image; when you are done fixing it, click ✓ '
+	'to leave Review and return it to Annotated / Pending / Skipped as usual. '
+	'Opening an image does not skip it; Next on a blank image does.\n'
 	'\n'
 	'DRAWING (AI Help off)\n'
 	'• Left-click: add corners\n'
@@ -653,10 +661,182 @@ class QueueListDialog(wx.Dialog):
 
 
 
+class AnnotatedFilterDialog(wx.Dialog):
+
+	"""Per-class count filter for the Annotated queue.
+
+	Exact Choice when a class's max count across frames is < 10.
+	Inclusive min/max textboxes when max count is >= 10.
+	Any (default) leaves that class unconstrained.
+	"""
+
+	def __init__(self,parent,class_names,max_counts,current_filters):
+
+		super().__init__(parent,title='Filter Annotated',size=(520,420))
+		self.class_names=list(class_names)
+		self.max_counts=dict(max_counts)
+		self.result_filters=None
+		self._rows={}
+
+		root=wx.BoxSizer(wx.VERTICAL)
+		hint=wx.StaticText(
+			self,
+			label='Set counts per object type. Any ignores that type. '
+			'Multiple types are combined with AND.'
+			)
+		hint.Wrap(480)
+		root.Add(hint,0,wx.ALL,12)
+
+		scroll=wx.ScrolledWindow(self,style=wx.VSCROLL)
+		scroll.SetScrollRate(0,10)
+		grid=wx.FlexGridSizer(cols=2,hgap=12,vgap=8)
+		grid.AddGrowableCol(1,1)
+
+		for classname in self.class_names:
+			max_count=int(self.max_counts.get(classname,0) or 0)
+			label=wx.StaticText(scroll,label=classname)
+			grid.Add(label,0,wx.ALIGN_CENTER_VERTICAL)
+			row_panel=wx.Panel(scroll)
+			row_sizer=wx.BoxSizer(wx.HORIZONTAL)
+			existing=current_filters.get(classname)
+
+			if max_count>=10:
+				min_box=wx.TextCtrl(row_panel,size=(64,-1))
+				max_box=wx.TextCtrl(row_panel,size=(64,-1))
+				any_btn=wx.ToggleButton(row_panel,label='Any',size=(56,-1))
+				if existing is None:
+					any_btn.SetValue(True)
+					min_box.Disable()
+					max_box.Disable()
+				elif isinstance(existing,tuple):
+					lo,hi=existing
+					if lo is not None:
+						min_box.SetValue(str(lo))
+					if hi is not None:
+						max_box.SetValue(str(hi))
+					any_btn.SetValue(False)
+				else:
+					# exact value carried over after max grew past threshold
+					min_box.SetValue(str(int(existing)))
+					max_box.SetValue(str(int(existing)))
+					any_btn.SetValue(False)
+
+				def _toggle_any(event,a=any_btn,mn=min_box,mx=max_box):
+					use_any=a.GetValue()
+					mn.Enable(not use_any)
+					mx.Enable(not use_any)
+					if use_any:
+						mn.ChangeValue('')
+						mx.ChangeValue('')
+
+				any_btn.Bind(wx.EVT_TOGGLEBUTTON,_toggle_any)
+				row_sizer.Add(any_btn,0,wx.ALIGN_CENTER_VERTICAL|wx.RIGHT,8)
+				row_sizer.Add(wx.StaticText(row_panel,label='min'),0,wx.ALIGN_CENTER_VERTICAL|wx.RIGHT,4)
+				row_sizer.Add(min_box,0,wx.ALIGN_CENTER_VERTICAL|wx.RIGHT,10)
+				row_sizer.Add(wx.StaticText(row_panel,label='max'),0,wx.ALIGN_CENTER_VERTICAL|wx.RIGHT,4)
+				row_sizer.Add(max_box,0,wx.ALIGN_CENTER_VERTICAL)
+				row_panel.SetSizer(row_sizer)
+				self._rows[classname]=('range',any_btn,min_box,max_box)
+			else:
+				choices=['Any']+[str(i) for i in range(0,max_count+1)]
+				choice=wx.Choice(row_panel,choices=choices)
+				choice.SetSelection(0)
+				if existing is None:
+					choice.SetSelection(0)
+				elif isinstance(existing,int) and 0<=existing<=max_count:
+					choice.SetSelection(existing+1)
+				elif isinstance(existing,tuple):
+					lo,hi=existing
+					if lo is not None and lo==hi and 0<=lo<=max_count:
+						choice.SetSelection(lo+1)
+				row_sizer.Add(choice,1,wx.EXPAND)
+				row_panel.SetSizer(row_sizer)
+				self._rows[classname]=('exact',choice)
+
+			grid.Add(row_panel,1,wx.EXPAND)
+
+		scroll.SetSizer(grid)
+		root.Add(scroll,1,wx.EXPAND|wx.LEFT|wx.RIGHT,12)
+
+		buttons=wx.BoxSizer(wx.HORIZONTAL)
+		clear_btn=wx.Button(self,label='Clear all')
+		clear_btn.Bind(wx.EVT_BUTTON,self.on_clear_all)
+		buttons.Add(clear_btn,0)
+		buttons.AddStretchSpacer(1)
+		ok_btn=wx.Button(self,wx.ID_OK,label='Apply')
+		cancel_btn=wx.Button(self,wx.ID_CANCEL,label='Cancel')
+		ok_btn.Bind(wx.EVT_BUTTON,self.on_apply)
+		buttons.Add(ok_btn,0,wx.RIGHT,8)
+		buttons.Add(cancel_btn,0)
+		root.Add(buttons,0,wx.EXPAND|wx.ALL,12)
+
+		self.SetSizer(root)
+		self.CentreOnParent()
+
+
+	def on_clear_all(self,event):
+
+		for classname,row in self._rows.items():
+			if row[0]=='exact':
+				row[1].SetSelection(0)
+			else:
+				_,any_btn,min_box,max_box=row
+				any_btn.SetValue(True)
+				min_box.ChangeValue('')
+				max_box.ChangeValue('')
+				min_box.Disable()
+				max_box.Disable()
+
+
+	def _parse_optional_int(self,ctrl,field_name,classname):
+
+		raw=ctrl.GetValue().strip()
+		if raw=='':
+			return None
+		try:
+			value=int(raw)
+		except ValueError:
+			raise ValueError(f'{classname}: {field_name} must be a whole number.')
+		if value<0:
+			raise ValueError(f'{classname}: {field_name} cannot be negative.')
+		return value
+
+
+	def on_apply(self,event):
+
+		filters={}
+		try:
+			for classname,row in self._rows.items():
+				if row[0]=='exact':
+					choice=row[1]
+					sel=choice.GetSelection()
+					if sel<=0:
+						continue
+					filters[classname]=sel-1
+				else:
+					_,_,min_box,max_box=row
+					any_btn=row[1]
+					if any_btn.GetValue():
+						continue
+					lo=self._parse_optional_int(min_box,'min',classname)
+					hi=self._parse_optional_int(max_box,'max',classname)
+					if lo is None and hi is None:
+						continue
+					if lo is not None and hi is not None and lo>hi:
+						raise ValueError(f'{classname}: min cannot be greater than max.')
+					filters[classname]=(lo,hi)
+		except ValueError as exc:
+			wx.MessageBox(str(exc),'Invalid filter',wx.ICON_ERROR)
+			return
+		self.result_filters=filters
+		self.EndModal(wx.ID_OK)
+
+
+
 class WindowLv3_AnnotateImages(wx.Frame):
 
-	QUEUE_ORDER=('pending','annotated','skipped')
-	QUEUE_TITLES={'pending':'Pending','annotated':'Annotated','skipped':'Skipped'}
+	QUEUE_ORDER=('pending','annotated','review','skipped')
+	QUEUE_TITLES={'pending':'Pending','annotated':'Annotated','review':'Review','skipped':'Skipped'}
 
 	def __init__(self,parent,title,path_to_images,result_path,color_map,aug_methods,model_cp=None,model_cfg=None):
 
@@ -693,6 +873,9 @@ class WindowLv3_AnnotateImages(wx.Frame):
 		self.zoom_step=1.25
 		self.active_queue='pending'
 		self._queue_last_path={q:None for q in self.QUEUE_ORDER}
+		# classname -> None omitted; int exact count; (min,max) inclusive range (None side = open)
+		self.annotated_filters={}
+		self.review_images=set()
 
 		self.init_ui()
 		self.active_queue=self._default_queue()
@@ -722,23 +905,33 @@ class WindowLv3_AnnotateImages(wx.Frame):
 		hbox.Add(self.help_button,flag=wx.TOP|wx.BOTTOM|wx.LEFT|wx.ALIGN_CENTER_VERTICAL,border=2)
 		hbox.AddSpacer(10)
 
-		self.ai_button=wx.ToggleButton(panel,label='AI Help: OFF',size=(200,30))
+		self.ai_button=wx.ToggleButton(panel,label='AI Help: OFF',size=(140,30))
 		self.ai_button.Bind(wx.EVT_TOGGLEBUTTON,self.toggle_ai)
 		hbox.Add(self.ai_button,flag=wx.ALL,border=2)
 
-		self.prev_button=wx.Button(panel,label='← Prev',size=(200,30))
+		self.prev_button=wx.Button(panel,label='← Prev',size=(160,30))
 		self.prev_button.Bind(wx.EVT_BUTTON,self.previous_image)
 		hbox.Add(self.prev_button,flag=wx.ALL,border=2)
 
-		self.next_button=wx.Button(panel,label='Next →',size=(200,30))
+		self.next_button=wx.Button(panel,label='Next →',size=(160,30))
 		self.next_button.Bind(wx.EVT_BUTTON,self.next_image)
 		hbox.Add(self.next_button,flag=wx.ALL,border=2)
 
-		self.delete_button=wx.Button(panel,label='Delete',size=(200,30))
+		self.to_review_button=wx.Button(panel,label='To Review',size=(100,30))
+		self.to_review_button.Bind(wx.EVT_BUTTON,self.send_current_to_review)
+		wx.Button.SetToolTip(self.to_review_button,'Flag this image for a later review pass in this session')
+		hbox.Add(self.to_review_button,flag=wx.ALL,border=2)
+
+		self.review_done_button=wx.Button(panel,label='✓',size=(36,30))
+		self.review_done_button.Bind(wx.EVT_BUTTON,self.mark_review_done)
+		wx.Button.SetToolTip(self.review_done_button,'Done with review: return this image to Annotated / Pending / Skipped')
+		hbox.Add(self.review_done_button,flag=wx.ALL,border=2)
+
+		self.delete_button=wx.Button(panel,label='Delete',size=(120,30))
 		self.delete_button.Bind(wx.EVT_BUTTON,self.delete_image)
 		hbox.Add(self.delete_button,flag=wx.ALL,border=2)
 
-		self.export_button=wx.Button(panel,label='Export Annotations',size=(200,30))
+		self.export_button=wx.Button(panel,label='Export Annotations',size=(160,30))
 		self.export_button.Bind(wx.EVT_BUTTON,self.export_annotations)
 		hbox.Add(self.export_button,flag=wx.ALL,border=2)
 		vbox.Add(hbox,flag=wx.ALIGN_CENTER|wx.TOP,border=5)
@@ -746,10 +939,11 @@ class WindowLv3_AnnotateImages(wx.Frame):
 		queue_box=wx.BoxSizer(wx.HORIZONTAL)
 		self.queue_buttons={}
 		self.queue_list_buttons={}
+		self.annotated_filter_button=None
 		for i,queue_id in enumerate(self.QUEUE_ORDER):
 			# Tight [toggle ☰] pair — plain glyph, no button chrome.
 			pair=wx.BoxSizer(wx.HORIZONTAL)
-			btn=wx.ToggleButton(panel,label=f'{self.QUEUE_TITLES[queue_id]} (0)',size=(118,26))
+			btn=wx.ToggleButton(panel,label=f'{self.QUEUE_TITLES[queue_id]} (0)',size=(108,26))
 			btn.Bind(wx.EVT_TOGGLEBUTTON,lambda event,q=queue_id:self.on_queue_select(q))
 			pair.Add(btn,0,wx.ALIGN_CENTER_VERTICAL)
 			self.queue_buttons[queue_id]=btn
@@ -759,6 +953,13 @@ class WindowLv3_AnnotateImages(wx.Frame):
 			wx.Window.SetToolTip(list_icon,f'Browse / search {self.QUEUE_TITLES[queue_id]} images')
 			pair.Add(list_icon,0,wx.ALIGN_CENTER_VERTICAL|wx.LEFT,5)
 			self.queue_list_buttons[queue_id]=list_icon
+			if queue_id=='annotated':
+				filter_icon=wx.StaticText(panel,label='⚙')
+				filter_icon.SetCursor(wx.Cursor(wx.CURSOR_HAND))
+				filter_icon.Bind(wx.EVT_LEFT_DOWN,self.show_annotated_filter)
+				wx.Window.SetToolTip(filter_icon,'Filter Annotated by object counts')
+				pair.Add(filter_icon,0,wx.ALIGN_CENTER_VERTICAL|wx.LEFT,5)
+				self.annotated_filter_button=filter_icon
 			queue_box.Add(pair,0,wx.ALIGN_CENTER_VERTICAL|wx.LEFT,0 if i==0 else 10)
 		vbox.Add(queue_box,flag=wx.ALIGN_CENTER|wx.TOP,border=4)
 
@@ -938,6 +1139,61 @@ class WindowLv3_AnnotateImages(wx.Frame):
 		return len(info.get('polygons',[]))
 
 
+	def _class_counts_for_image(self,name):
+
+		"""Count committed polygons per classname for one image."""
+
+		counts={classname:0 for classname in self.color_map}
+		record=self.information.get(name)
+		if not record:
+			return counts
+		for classname in record.get('class_names',[]):
+			if classname in counts:
+				counts[classname]+=1
+			else:
+				counts[classname]=counts.get(classname,0)+1
+		return counts
+
+
+	def _max_class_counts(self):
+
+		"""Max per-class count across all session frames."""
+
+		max_counts={classname:0 for classname in self.color_map}
+		for path in self.image_paths:
+			counts=self._class_counts_for_image(os.path.basename(path))
+			for classname,count in counts.items():
+				if classname not in max_counts or count>max_counts[classname]:
+					max_counts[classname]=count
+		return max_counts
+
+
+	def _annotated_filter_active(self):
+
+		return bool(self.annotated_filters)
+
+
+	def _matches_annotated_filter(self,name):
+
+		"""True if image satisfies every active per-class count constraint (AND)."""
+
+		if not self.annotated_filters:
+			return True
+		counts=self._class_counts_for_image(name)
+		for classname,rule in self.annotated_filters.items():
+			have=counts.get(classname,0)
+			if isinstance(rule,tuple):
+				lo,hi=rule
+				if lo is not None and have<lo:
+					return False
+				if hi is not None and have>hi:
+					return False
+			else:
+				if have!=int(rule):
+					return False
+		return True
+
+
 	def _ensure_image_info(self,name):
 
 		if name not in self.information:
@@ -979,6 +1235,9 @@ class WindowLv3_AnnotateImages(wx.Frame):
 
 	def _structural_class(self,name):
 
+		# Review is session-only and takes priority for browsing piles.
+		if name in self.review_images:
+			return 'review'
 		n_poly=self._polygon_count(name)
 		if n_poly>0:
 			return 'annotated'
@@ -998,7 +1257,11 @@ class WindowLv3_AnnotateImages(wx.Frame):
 
 		"""Membership for Prev/Next within a queue."""
 
-		return self._structural_class(name)==queue
+		if self._structural_class(name)!=queue:
+			return False
+		if queue=='annotated':
+			return self._matches_annotated_filter(name)
+		return True
 
 
 	def queue_paths(self,queue=None):
@@ -1010,8 +1273,20 @@ class WindowLv3_AnnotateImages(wx.Frame):
 	def queue_counts(self):
 
 		counts={q:0 for q in self.QUEUE_ORDER}
+		annotated_total=0
+		annotated_matched=0
 		for path in self.image_paths:
-			counts[self.classify_image(os.path.basename(path))]+=1
+			name=os.path.basename(path)
+			structural=self._structural_class(name)
+			if structural=='annotated':
+				annotated_total+=1
+				if self._matches_annotated_filter(name):
+					annotated_matched+=1
+					counts['annotated']+=1
+			else:
+				counts[structural]+=1
+		counts['_annotated_total']=annotated_total
+		counts['_annotated_matched']=annotated_matched
 		return counts
 
 
@@ -1031,14 +1306,44 @@ class WindowLv3_AnnotateImages(wx.Frame):
 		if not hasattr(self,'queue_buttons'):
 			return
 		counts=self.queue_counts()
+		default_fg=wx.SystemSettings.GetColour(wx.SYS_COLOUR_BTNTEXT)
 		for queue_id,btn in self.queue_buttons.items():
-			btn.SetLabel(f'{self.QUEUE_TITLES[queue_id]} ({counts[queue_id]})')
+			if queue_id=='annotated' and self._annotated_filter_active():
+				matched=counts.get('_annotated_matched',counts['annotated'])
+				total=counts.get('_annotated_total',matched)
+				btn.SetLabel(f'{self.QUEUE_TITLES[queue_id]} ({matched}/{total})')
+				if matched==0:
+					btn.SetForegroundColour(wx.Colour(180,0,0))
+				else:
+					btn.SetForegroundColour(default_fg)
+			else:
+				btn.SetLabel(f'{self.QUEUE_TITLES[queue_id]} ({counts[queue_id]})')
+				btn.SetForegroundColour(default_fg)
 			btn.SetValue(queue_id==self.active_queue)
+		if self.annotated_filter_button is not None:
+			matched=counts.get('_annotated_matched',counts.get('annotated',0))
+			tip='Filter Annotated by object counts'
+			if self._annotated_filter_active():
+				tip+=' (filter active)'
+				if matched==0:
+					tip+=' — no images match'
+					self.annotated_filter_button.SetForegroundColour(wx.Colour(180,0,0))
+				else:
+					self.annotated_filter_button.SetForegroundColour(default_fg)
+			else:
+				self.annotated_filter_button.SetForegroundColour(default_fg)
+			wx.Window.SetToolTip(self.annotated_filter_button,tip)
+		name=self.current_image_name()
+		in_review=name is not None and name in self.review_images
+		if hasattr(self,'to_review_button'):
+			self.to_review_button.Enable(name is not None and self.current_image is not None and not in_review)
+		if hasattr(self,'review_done_button'):
+			self.review_done_button.Enable(in_review)
 		# Keep Next available for a blank image at end-of-queue so Next can still skip it.
 		can_prev=self._prev_path_in_active_queue() is not None
 		can_next=(
 			self._next_path_in_active_queue() is not None
-			or (self.current_image is not None and self._current_is_blank())
+			or (self.current_image is not None and self._current_is_blank() and self.active_queue!='review')
 		)
 		self.prev_button.Enable(can_prev)
 		self.next_button.Enable(can_next)
@@ -1075,6 +1380,125 @@ class WindowLv3_AnnotateImages(wx.Frame):
 		if dialog.ShowModal()==wx.ID_OK and dialog.selected_path:
 			self.go_to_queue_path(queue_id,dialog.selected_path)
 		dialog.Destroy()
+		self.canvas.SetFocus()
+
+
+	def show_annotated_filter(self,event):
+
+		class_names=sorted(self.color_map.keys())
+		dialog=AnnotatedFilterDialog(
+			self,
+			class_names,
+			self._max_class_counts(),
+			self.annotated_filters
+			)
+		if dialog.ShowModal()==wx.ID_OK and dialog.result_filters is not None:
+			self.annotated_filters=dict(dialog.result_filters)
+			self._after_annotated_filter_changed()
+			if self._annotated_filter_active():
+				matched=sum(
+					1 for path in self.image_paths
+					if self._structural_class(os.path.basename(path))=='annotated'
+					and self._matches_annotated_filter(os.path.basename(path))
+					)
+				if matched==0:
+					wx.MessageBox(
+						'No annotated images match this filter.\n\n'
+						'Annotated shows 0 matches in red until you change or clear the filter.',
+						'No matches',
+						wx.ICON_WARNING
+						)
+		dialog.Destroy()
+		self.canvas.SetFocus()
+
+
+	def _after_annotated_filter_changed(self):
+
+		"""Keep navigation coherent after Annotated filter changes."""
+
+		if self.active_queue!='annotated':
+			self.refresh_queue_ui()
+			return
+		paths=self.queue_paths('annotated')
+		if not paths:
+			self.refresh_queue_ui()
+			return
+		current=self.image_paths[self.current_image_id] if self.image_paths and 0<=self.current_image_id<len(self.image_paths) else None
+		if current in paths:
+			self.refresh_queue_ui()
+			return
+		self.current_image_id=self.image_paths.index(paths[0])
+		self.load_current_image()
+
+
+	def send_current_to_review(self,event):
+
+		name=self.current_image_name()
+		if name is None or self.current_image is None:
+			self.canvas.SetFocus()
+			return
+		if name in self.review_images:
+			self.canvas.SetFocus()
+			return
+		queue_before=self.queue_paths()
+		path=self.image_paths[self.current_image_id]
+		self.review_images.add(name)
+		# Stay on Annotated (or current queue) browsing: advance to next remaining item.
+		remaining=[p for p in queue_before if p!=path]
+		if self.active_queue=='review':
+			self.refresh_queue_ui()
+			self.canvas.SetFocus()
+			return
+		if remaining:
+			# Prefer the next item after the flagged one in the prior queue order.
+			try:
+				idx=queue_before.index(path)
+			except ValueError:
+				idx=0
+			target=None
+			for candidate in queue_before[idx+1:]:
+				if candidate in remaining:
+					target=candidate
+					break
+			if target is None:
+				target=remaining[0]
+			self.current_image_id=self.image_paths.index(target)
+			self.load_current_image()
+		else:
+			self.refresh_queue_ui()
+		self.canvas.SetFocus()
+
+
+	def mark_review_done(self,event):
+
+		name=self.current_image_name()
+		if name is None or name not in self.review_images:
+			self.canvas.SetFocus()
+			return
+		queue_before=self.queue_paths()
+		path=self.image_paths[self.current_image_id]
+		self.review_images.discard(name)
+		# After leaving Review, image sits in Annotated / Pending / Skipped by normal rules.
+		if self.active_queue=='review':
+			remaining=[p for p in queue_before if p!=path]
+			if remaining:
+				try:
+					idx=queue_before.index(path)
+				except ValueError:
+					idx=0
+				target=None
+				for candidate in queue_before[idx+1:]:
+					if candidate in remaining:
+						target=candidate
+						break
+				if target is None:
+					target=remaining[0]
+				self.current_image_id=self.image_paths.index(target)
+				self.load_current_image()
+			else:
+				self.refresh_queue_ui()
+		else:
+			self.refresh_queue_ui()
 		self.canvas.SetFocus()
 
 
@@ -1274,6 +1698,7 @@ class WindowLv3_AnnotateImages(wx.Frame):
 			self.image_paths.remove(path)
 			image_name=os.path.basename(path)
 			self.skipped_images.discard(image_name)
+			self.review_images.discard(image_name)
 			if image_name in self.information:
 				del self.information[image_name]
 			remaining=[p for p in queue_before if p!=path]
